@@ -23,6 +23,13 @@ export interface AnalysisResult {
   gptAnswer: string;
   similarity: number;
   urlPattern?: string;
+  matchFound?: boolean;
+  idealPrompt?: string;
+  intentType?: 'Informational' | 'Transactional' | 'Navigational' | 'Mixed';
+  priorityScore?: number;
+  keywordGaps?: string[];
+  entityMismatch?: boolean;
+  sentenceStructureIssue?: boolean;
 }
 
 interface AnalysisResultsProps {
@@ -64,29 +71,150 @@ const getRegion = (location: string): string => {
   return 'Other';
 };
 
+const analyzeSemanticGaps = (pageText: string, gptAnswer: string): {
+  keywordGaps: string[];
+  entityMismatch: boolean;
+  sentenceStructureIssue: boolean;
+} => {
+  const criticalKeywords = ['book', 'cheap', 'price', 'ticket', 'eurostar', 'omio', 'trainline', 'schedule', 'journey'];
+  const pageWords = pageText.toLowerCase().split(/\s+/);
+  const gptWords = gptAnswer.toLowerCase().split(/\s+/);
+  
+  const keywordGaps = criticalKeywords.filter(keyword => 
+    gptWords.includes(keyword) && !pageWords.includes(keyword)
+  );
+  
+  const entities = {
+    page: {
+      hasTrainline: pageText.toLowerCase().includes('trainline'),
+      hasEurostar: pageText.toLowerCase().includes('eurostar'),
+      hasOmio: pageText.toLowerCase().includes('omio')
+    },
+    gpt: {
+      hasTrainline: gptAnswer.toLowerCase().includes('trainline'),
+      hasEurostar: gptAnswer.toLowerCase().includes('eurostar'), 
+      hasOmio: gptAnswer.toLowerCase().includes('omio')
+    }
+  };
+  
+  const entityMismatch = 
+    (entities.gpt.hasEurostar && entities.page.hasTrainline) ||
+    (entities.gpt.hasOmio && entities.page.hasTrainline) ||
+    (entities.gpt.hasTrainline && (entities.page.hasEurostar || entities.page.hasOmio));
+  
+  const pageHasPricing = /price|cost|£|\$|fare|cheap|expensive/.test(pageText.toLowerCase());
+  const gptHasPricing = /price|cost|£|\$|fare|cheap|expensive/.test(gptAnswer.toLowerCase());
+  const pageHasVague = /you can travel|journey from|route between/.test(pageText.toLowerCase());
+  
+  const sentenceStructureIssue = !pageHasPricing && gptHasPricing && pageHasVague;
+  
+  return { keywordGaps, entityMismatch, sentenceStructureIssue };
+};
+
+const classifyIntent = (prompt: string, pageText: string): 'Informational' | 'Transactional' | 'Navigational' | 'Mixed' => {
+  const transactionalKeywords = ['buy', 'book', 'cheap', 'price', 'ticket', 'online', 'purchase'];
+  const informationalKeywords = ['how', 'what', 'when', 'schedule', 'duration', 'route', 'info'];
+  const navigationalKeywords = ['trainline', 'website', 'official', 'login', 'account'];
+  
+  const text = (prompt + ' ' + pageText).toLowerCase();
+  
+  const transactionalCount = transactionalKeywords.filter(kw => text.includes(kw)).length;
+  const informationalCount = informationalKeywords.filter(kw => text.includes(kw)).length;
+  const navigationalCount = navigationalKeywords.filter(kw => text.includes(kw)).length;
+  
+  if (transactionalCount > 0 && informationalCount > 0) return 'Mixed';
+  if (transactionalCount > informationalCount && transactionalCount > navigationalCount) return 'Transactional';
+  if (informationalCount > navigationalCount) return 'Informational';
+  return 'Navigational';
+};
+
+const calculatePriorityScore = (result: AnalysisResult): number => {
+  let score = 50; // Base score
+  
+  // Similarity impact (lower similarity = higher priority)
+  score += (1 - result.similarity) * 40;
+  
+  // Intent type impact
+  if (result.intentType === 'Transactional') score += 20;
+  if (result.intentType === 'Mixed') score += 15;
+  
+  // Keyword gaps impact
+  if (result.keywordGaps && result.keywordGaps.length > 0) score += result.keywordGaps.length * 5;
+  
+  // Entity mismatch impact
+  if (result.entityMismatch) score += 15;
+  
+  // Sentence structure issues
+  if (result.sentenceStructureIssue) score += 10;
+  
+  return Math.min(score, 100);
+};
+
 export const AnalysisResults: React.FC<AnalysisResultsProps> = ({
   results,
   onExportCSV,
 }) => {
   if (results.length === 0) return null;
 
-  const avgSimilarity = results.reduce((sum, r) => sum + r.similarity, 0) / results.length;
+  // Enhanced analysis with new features
+  const enhancedResults = results.map(result => {
+    const semanticAnalysis = analyzeSemanticGaps(result.pageText, result.gptAnswer);
+    const intentType = classifyIntent(result.prompt, result.pageText);
+    const matchFound = result.prompt && result.gptAnswer ? true : false;
+    const idealPrompt = result.urlPattern || extractRouteData(result.url).route.replace('-', ' ');
+    
+    const enhanced = {
+      ...result,
+      ...semanticAnalysis,
+      intentType,
+      matchFound,
+      idealPrompt,
+      priorityScore: 0
+    };
+    
+    enhanced.priorityScore = calculatePriorityScore(enhanced);
+    return enhanced;
+  });
+
+  const avgSimilarity = enhancedResults.reduce((sum, r) => sum + r.similarity, 0) / enhancedResults.length;
   
+  // New Analytics Data
+  const matchFoundCount = enhancedResults.filter(r => r.matchFound).length;
+  const noMatchCount = enhancedResults.length - matchFoundCount;
+  
+  const intentDistribution = enhancedResults.reduce((acc, r) => {
+    acc[r.intentType!] = (acc[r.intentType!] || 0) + 1;
+    return acc;
+  }, {} as Record<string, number>);
+  
+  const semanticIssues = {
+    keywordGaps: enhancedResults.filter(r => r.keywordGaps!.length > 0).length,
+    entityMismatch: enhancedResults.filter(r => r.entityMismatch).length,
+    structureIssues: enhancedResults.filter(r => r.sentenceStructureIssue).length
+  };
+  
+  const priorityBuckets = {
+    fixNow: enhancedResults.filter(r => r.priorityScore! >= 80).length,
+    fixLater: enhancedResults.filter(r => r.priorityScore! >= 60 && r.priorityScore! < 80).length,
+    monitor: enhancedResults.filter(r => r.priorityScore! < 60).length
+  };
+
   // Prepare chart data
-  const barData = results.map((result, index) => ({
+  const barData = enhancedResults.map((result, index) => ({
     name: `URL ${index + 1}`,
     similarity: result.similarity,
+    priority: result.priorityScore,
     url: result.url,
   }));
 
   // Enhanced analytics data
-  const excellent = results.filter(r => r.similarity >= 0.8).length;
-  const good = results.filter(r => r.similarity >= 0.7 && r.similarity < 0.8).length;
-  const fair = results.filter(r => r.similarity >= 0.6 && r.similarity < 0.7).length;
-  const poor = results.filter(r => r.similarity < 0.6).length;
+  const excellent = enhancedResults.filter(r => r.similarity >= 0.8).length;
+  const good = enhancedResults.filter(r => r.similarity >= 0.7 && r.similarity < 0.8).length;
+  const fair = enhancedResults.filter(r => r.similarity >= 0.6 && r.similarity < 0.7).length;
+  const poor = enhancedResults.filter(r => r.similarity < 0.6).length;
 
   // Route-based analysis
-  const routeAnalysis = results.reduce((acc, result) => {
+  const routeAnalysis = enhancedResults.reduce((acc, result) => {
     const { origin, destination } = extractRouteData(result.url);
     const key = `${origin} to ${destination}`;
     if (!acc[key]) {
@@ -99,7 +227,7 @@ export const AnalysisResults: React.FC<AnalysisResultsProps> = ({
   }, {} as Record<string, { routes: AnalysisResult[]; totalScore: number; count: number }>);
 
   // Geographic analysis
-  const regionAnalysis = results.reduce((acc, result) => {
+  const regionAnalysis = enhancedResults.reduce((acc, result) => {
     const { origin, destination } = extractRouteData(result.url);
     const regions = [getRegion(origin), getRegion(destination)];
     regions.forEach(region => {
@@ -112,8 +240,8 @@ export const AnalysisResults: React.FC<AnalysisResultsProps> = ({
   }, {} as Record<string, { count: number; totalScore: number; urls: AnalysisResult[] }>);
 
   // Actionable insights
-  const criticalIssues = results.filter(r => r.similarity < 0.7);
-  const optimizationOpportunities = results.filter(r => r.similarity >= 0.7 && r.similarity < 0.85);
+  const criticalIssues = enhancedResults.filter(r => r.similarity < 0.7);
+  const optimizationOpportunities = enhancedResults.filter(r => r.similarity >= 0.7 && r.similarity < 0.85);
 
   const pieData = [
     { name: 'Excellent (80-100%)', value: excellent, fill: CHART_COLORS[0] },
@@ -141,13 +269,16 @@ export const AnalysisResults: React.FC<AnalysisResultsProps> = ({
   return (
     <div className="space-y-6">
       {/* Summary Cards */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
         <Card className="p-6">
           <div className="flex items-center gap-2 mb-2">
             <div className="h-2 w-2 rounded-full bg-primary"></div>
             <span className="text-sm font-medium text-muted-foreground">URLs Analyzed</span>
           </div>
-          <p className="text-3xl font-bold">{results.length}</p>
+          <p className="text-3xl font-bold">{enhancedResults.length}</p>
+          <p className="text-xs text-muted-foreground mt-1">
+            {matchFoundCount} with GPT match, {noMatchCount} missing
+          </p>
         </Card>
 
         <Card className="p-6">
@@ -156,6 +287,20 @@ export const AnalysisResults: React.FC<AnalysisResultsProps> = ({
             <span className="text-sm font-medium text-muted-foreground">Average Similarity</span>
           </div>
           <p className="text-3xl font-bold">{(avgSimilarity * 100).toFixed(1)}%</p>
+          <p className="text-xs text-muted-foreground mt-1">
+            {semanticIssues.keywordGaps + semanticIssues.entityMismatch + semanticIssues.structureIssues} semantic issues
+          </p>
+        </Card>
+
+        <Card className="p-6">
+          <div className="flex items-center gap-2 mb-2">
+            <AlertTriangle className="h-4 w-4 text-warning" />
+            <span className="text-sm font-medium text-muted-foreground">Priority Actions</span>
+          </div>
+          <p className="text-3xl font-bold">{priorityBuckets.fixNow}</p>
+          <p className="text-xs text-muted-foreground mt-1">
+            Critical / {priorityBuckets.fixLater} medium / {priorityBuckets.monitor} monitor
+          </p>
         </Card>
 
         <Card className="p-6 flex items-center justify-between">
@@ -168,6 +313,171 @@ export const AnalysisResults: React.FC<AnalysisResultsProps> = ({
           </div>
         </Card>
       </div>
+
+      {/* New Advanced Analytics */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <Card className="p-6">
+          <h3 className="text-lg font-semibold mb-4">Prompt Coverage Analysis</h3>
+          <div className="space-y-4">
+            <div className="flex items-center justify-between">
+              <span className="text-sm">Match Found</span>
+              <div className="flex items-center gap-2">
+                <Badge variant={matchFoundCount > 0 ? "default" : "destructive"}>
+                  {matchFoundCount}
+                </Badge>
+                <span className="text-xs text-muted-foreground">
+                  {((matchFoundCount / enhancedResults.length) * 100).toFixed(0)}%
+                </span>
+              </div>
+            </div>
+            <div className="flex items-center justify-between">
+              <span className="text-sm">Missing Coverage</span>
+              <div className="flex items-center gap-2">
+                <Badge variant={noMatchCount > 0 ? "destructive" : "default"}>
+                  {noMatchCount}
+                </Badge>
+                <span className="text-xs text-muted-foreground">
+                  {((noMatchCount / enhancedResults.length) * 100).toFixed(0)}%
+                </span>
+              </div>
+            </div>
+            {noMatchCount > 0 && (
+              <div className="p-3 bg-destructive/10 rounded-lg">
+                <p className="text-sm font-medium text-destructive mb-2">Missing Ideal Prompts:</p>
+                <div className="space-y-1">
+                  {enhancedResults.filter(r => !r.matchFound).slice(0, 3).map((result, i) => (
+                    <div key={i} className="text-xs text-muted-foreground">
+                      "{result.idealPrompt}"
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        </Card>
+
+        <Card className="p-6">
+          <h3 className="text-lg font-semibold mb-4">Intent Classification</h3>
+          <ResponsiveContainer width="100%" height={200}>
+            <PieChart>
+              <Pie
+                data={Object.entries(intentDistribution).map(([intent, count]) => ({
+                  name: intent,
+                  value: count,
+                  fill: CHART_COLORS[Object.keys(intentDistribution).indexOf(intent) % CHART_COLORS.length]
+                }))}
+                cx="50%"
+                cy="50%"
+                outerRadius={80}
+                dataKey="value"
+                label={({ name, value }) => `${name}: ${value}`}
+              >
+                {Object.entries(intentDistribution).map((entry, index) => (
+                  <Cell key={`cell-${index}`} fill={CHART_COLORS[index % CHART_COLORS.length]} />
+                ))}
+              </Pie>
+              <Tooltip />
+            </PieChart>
+          </ResponsiveContainer>
+        </Card>
+
+        <Card className="p-6">
+          <h3 className="text-lg font-semibold mb-4">Semantic Issues</h3>
+          <div className="space-y-4">
+            <div className="flex items-center justify-between">
+              <span className="text-sm">Keyword Gaps</span>
+              <Badge variant={semanticIssues.keywordGaps > 0 ? "destructive" : "default"}>
+                {semanticIssues.keywordGaps}
+              </Badge>
+            </div>
+            <div className="flex items-center justify-between">
+              <span className="text-sm">Entity Mismatch</span>
+              <Badge variant={semanticIssues.entityMismatch > 0 ? "destructive" : "default"}>
+                {semanticIssues.entityMismatch}
+              </Badge>
+            </div>
+            <div className="flex items-center justify-between">
+              <span className="text-sm">Structure Issues</span>
+              <Badge variant={semanticIssues.structureIssues > 0 ? "destructive" : "default"}>
+                {semanticIssues.structureIssues}
+              </Badge>
+            </div>
+            {(semanticIssues.keywordGaps + semanticIssues.entityMismatch + semanticIssues.structureIssues) > 0 && (
+              <div className="p-3 bg-warning/10 rounded-lg">
+                <p className="text-sm font-medium text-warning mb-2">Common Issues:</p>
+                <div className="space-y-1 text-xs text-muted-foreground">
+                  {semanticIssues.keywordGaps > 0 && <div>• Missing key booking terms</div>}
+                  {semanticIssues.entityMismatch > 0 && <div>• Brand/platform confusion</div>}
+                  {semanticIssues.structureIssues > 0 && <div>• Vague vs specific language</div>}
+                </div>
+              </div>
+            )}
+          </div>
+        </Card>
+      </div>
+
+      {/* Priority Action Matrix */}
+      <Card className="p-6">
+        <h3 className="text-lg font-semibold mb-4">Priority Action Matrix</h3>
+        <div className="grid grid-cols-3 gap-4">
+          <div className="p-4 border border-destructive/20 bg-destructive/5 rounded-lg">
+            <div className="flex items-center gap-2 mb-2">
+              <AlertTriangle className="h-4 w-4 text-destructive" />
+              <h4 className="font-medium text-destructive">Fix Now</h4>
+            </div>
+            <p className="text-2xl font-bold text-destructive">{priorityBuckets.fixNow}</p>
+            <p className="text-xs text-muted-foreground">Priority Score: 80-100</p>
+            <div className="mt-2">
+              {enhancedResults
+                .filter(r => r.priorityScore! >= 80)
+                .slice(0, 3)
+                .map((result, i) => (
+                  <div key={i} className="text-xs p-1 bg-white rounded mb-1">
+                    {extractRouteData(result.url).route} ({(result.similarity * 100).toFixed(0)}%)
+                  </div>
+                ))}
+            </div>
+          </div>
+
+          <div className="p-4 border border-warning/20 bg-warning/5 rounded-lg">
+            <div className="flex items-center gap-2 mb-2">
+              <TrendingUp className="h-4 w-4 text-warning" />
+              <h4 className="font-medium text-warning">Fix Later</h4>
+            </div>
+            <p className="text-2xl font-bold text-warning">{priorityBuckets.fixLater}</p>
+            <p className="text-xs text-muted-foreground">Priority Score: 60-79</p>
+            <div className="mt-2">
+              {enhancedResults
+                .filter(r => r.priorityScore! >= 60 && r.priorityScore! < 80)
+                .slice(0, 3)
+                .map((result, i) => (
+                  <div key={i} className="text-xs p-1 bg-white rounded mb-1">
+                    {extractRouteData(result.url).route} ({(result.similarity * 100).toFixed(0)}%)
+                  </div>
+                ))}
+            </div>
+          </div>
+
+          <div className="p-4 border border-success/20 bg-success/5 rounded-lg">
+            <div className="flex items-center gap-2 mb-2">
+              <CheckCircle className="h-4 w-4 text-success" />
+              <h4 className="font-medium text-success">Monitor</h4>
+            </div>
+            <p className="text-2xl font-bold text-success">{priorityBuckets.monitor}</p>
+            <p className="text-xs text-muted-foreground">Priority Score: &lt;60</p>
+            <div className="mt-2">
+              {enhancedResults
+                .filter(r => r.priorityScore! < 60)
+                .slice(0, 3)
+                .map((result, i) => (
+                  <div key={i} className="text-xs p-1 bg-white rounded mb-1">
+                    {extractRouteData(result.url).route} ({(result.similarity * 100).toFixed(0)}%)
+                  </div>
+                ))}
+            </div>
+          </div>
+        </div>
+      </Card>
 
       {/* Charts */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
